@@ -1,0 +1,201 @@
+---
+title: Play Atari with LeRobot (Gymnasium)
+---
+
+LeRobot can control Gymnasium environments, including Atari games, using the same policy and processor APIs used for robotics. This tutorial shows how to collect data, train a policy offline, and evaluate it on Atari environments like `Pong` or `Breakout`.
+
+Prerequisites
+
+- Python 3.10+
+- GPU recommended
+- Install LeRobot and Atari deps:
+
+```bash
+pip install -U lerobot gymnasium[atari,accept-rom-license] moviepy
+```
+
+Quickstart: Evaluate a pretrained policy
+
+If you have a policy compatible with Atari observations/actions, you can evaluate with the CLI. Replace the policy path with your own.
+
+```bash
+lerobot-eval \
+  --policy.path=lerobot/diffusion_pusht \
+  --env.type=pusht \
+  --eval.batch_size=8 \
+  --eval.n_episodes=16 \
+  --device=cuda
+```
+
+For Atari, we’ll instantiate Gymnasium directly in Python below to keep things explicit.
+
+Step 1 — Make an Atari env with Gymnasium
+
+LeRobot’s observation processor expects channel-last uint8 images under the key `pixels`. We’ll wrap a Gymnasium Atari env to expose exactly that. Use Gymnasium v0.29+.
+
+```python
+import gymnasium as gym
+import numpy as np
+
+def make_atari_env(task: str = "ALE/Pong-v5", grayscale: bool = False, frame_size=(84, 84)):
+    # Base env
+    env = gym.make(task, render_mode="rgb_array")
+
+    # Optional wrappers: resize, grayscale, frame-skip, etc. Use Gymnasium’s wrappers or your own.
+    try:
+        from gymnasium.wrappers import ResizeObservation, GrayScaleObservation, TransformObservation
+    except Exception:
+        ResizeObservation = GrayScaleObservation = TransformObservation = None
+
+    if grayscale and GrayScaleObservation is not None:
+        env = GrayScaleObservation(env, keep_dim=True)
+
+    if ResizeObservation is not None:
+        env = ResizeObservation(env, frame_size)
+
+    # Ensure observations are uint8 and channel-last, exposed as {'pixels': np.ndarray}
+    if TransformObservation is not None:
+        env = TransformObservation(
+            env,
+            lambda obs: {"pixels": (obs.astype(np.uint8) if obs.dtype != np.uint8 else obs)},
+            observation_space=gym.spaces.Dict(
+                {"pixels": gym.spaces.Box(low=0, high=255, shape=env.observation_space.shape, dtype=np.uint8)}
+            ),
+        )
+    else:
+        # Fallback: wrap manually
+        class PixelsWrapper(gym.ObservationWrapper):
+            def __init__(self, env):
+                super().__init__(env)
+                self.observation_space = gym.spaces.Dict(
+                    {"pixels": gym.spaces.Box(low=0, high=255, shape=env.observation_space.shape, dtype=np.uint8)}
+                )
+
+            def observation(self, obs):
+                arr = obs if obs.dtype == np.uint8 else obs.astype(np.uint8)
+                return {"pixels": arr}
+
+        env = PixelsWrapper(env)
+
+    return env
+```
+
+Step 2 — Collect a small dataset (random or scripted)
+
+LeRobot’s dataset format is generic. Here’s how to record random play into a LeRobot dataset that can be used for imitation learning.
+
+```python
+import numpy as np
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+env = make_atari_env("ALE/Breakout-v5")
+
+# Define features: image frames and discrete actions
+features = {
+    "pixels": {"dtype": "video", "shape": env.observation_space["pixels"].shape, "names": ["h", "w", "c"]},
+    "action": {"dtype": "int64", "shape": (1,), "names": None},
+    "next.reward": {"dtype": "float32", "shape": (1,), "names": None},
+    "next.done": {"dtype": "bool", "shape": (1,), "names": None},
+}
+
+ds = LeRobotDataset.create(
+    repo_id="local/atari_breakout_random",
+    fps=env.metadata.get("render_fps", 30),
+    root="./data",
+    use_videos=True,
+    image_writer_threads=4,
+    image_writer_processes=0,
+    features=features,
+)
+
+num_episodes = 5
+max_steps = 1000
+
+for ep in range(num_episodes):
+    obs, info = env.reset()
+    for t in range(max_steps):
+        action = np.array([env.action_space.sample()], dtype=np.int64)
+        next_obs, reward, terminated, truncated, info = env.step(action.item())
+        frame = {
+            "pixels": obs["pixels"],
+            "action": action,
+            "next.reward": np.array([reward], dtype=np.float32),
+            "next.done": np.array([terminated or truncated], dtype=bool),
+        }
+        ds.add_frame(frame)
+        obs = next_obs
+        if terminated or truncated:
+            ds.save_episode()
+            break
+
+env.close()
+```
+
+Step 3 — Train a policy offline on the dataset
+
+Pick a LeRobot policy that supports image observations and discrete actions (e.g., SAC for continuous; for discrete you can adapt to a categorical head or use a diffusion policy with discrete mapping). As a simple starting point, we can still use image encoders with a small MLP head. Below is a minimal example using the generic training CLI and a compatible policy preset.
+
+```bash
+lerobot-train \
+  --dataset.repo_id=local/atari_breakout_random \
+  --dataset.root=./data \
+  --policy.type=diffusion \
+  --policy.device=cuda \
+  --steps=10000 \
+  --eval_freq=0
+```
+
+Notes
+
+- If your selected policy expects continuous actions, adapt the action processor to one-hot encode and decode to discrete indices, or choose a policy variant with categorical actions.
+- You can also write a lightweight custom policy using LeRobot’s `make_pre_post_processors` utilities and train with your own loop.
+
+Step 4 — Evaluate the trained policy in Gymnasium
+
+Use the evaluation script to roll out in Gymnasium. We’ll wire Gym directly to ensure `pixels` formatting and feed actions back.
+
+```python
+import torch
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.configs.policies import PreTrainedConfig
+
+env = make_atari_env("ALE/Breakout-v5")
+
+# Load the trained checkpoint directory (contains config.json and model.safetensors)
+policy_cfg = PreTrainedConfig.from_pretrained("outputs/train/.../checkpoints/000010/pretrained_model")
+policy = make_policy(cfg=policy_cfg)
+policy.eval()
+
+preprocessor, postprocessor = make_pre_post_processors(policy_cfg, pretrained_path=policy_cfg.pretrained_path)
+
+obs, _ = env.reset()
+episode_reward = 0.0
+with torch.inference_mode():
+    while True:
+        obs_processed = preprocessor({"observation.pixels": obs["pixels"]})
+        action = policy.select_action(obs_processed)
+        action = postprocessor(action)
+        # Map to discrete if your head outputs logits; here we assume scalar int action
+        act = int(action.squeeze().cpu().numpy())
+        obs, reward, terminated, truncated, _ = env.step(act)
+        episode_reward += reward
+        if terminated or truncated:
+            break
+
+print("Episode reward:", episode_reward)
+env.close()
+```
+
+Tips and gotchas
+
+- LeRobot’s `VanillaObservationProcessorStep` maps the `pixels` key to `observation.image` and converts HWC uint8 to BCHW float in [0, 1]. Ensure your wrapper provides channel-last uint8 frames.
+- Atari uses discrete actions. Make sure your policy head and postprocessor return integer actions.
+- Use Gymnasium wrappers for frame skipping, grayscale, and resizing to match your chosen encoder’s input size.
+- Log videos during evaluation with `lerobot-eval` by setting `--eval.n_episodes` and inspecting saved videos in the output directory.
+
+What’s next?
+
+- Replace random data with scripted or human demonstrations for better IL performance.
+- Try vectorized evaluation with LeRobot’s `make_env` utilities for batched rollouts.
+- Push your trained model to the Hub using the policy’s `push_model_to_hub` method.
+
