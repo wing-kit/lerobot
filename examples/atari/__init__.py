@@ -1,0 +1,2 @@
+# Atari examples package
+

@@ -9,6 +9,8 @@
     title: Imitation Learning for Robots
   - local: il_sim
     title: Imitation Learning in Sim
+  - local: atari
+    title: Play Atari with LeRobot
   - local: cameras
     title: Cameras
   - local: integrate_hardware
